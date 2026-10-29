@@ -51,7 +51,7 @@ Vyce.cloud 为免费 VPS（如 `Vps-Mini`，1 vCore / 2 GB RAM / 6 GB NVMe / 纯
 - **零依赖原生 Python** — 仅用标准库（`urllib`、`ssl`、`json`、`ipaddress`），无需 `pip install` 任何东西，开箱即用。
 - **双模驱动**：
   - **模式 A · 本地 CDP 无感捕获** — 本机 Chrome 开启 `--remote-debugging-port=9222` 后，自动从已登录标签页提取最新 `__Host-vyce_sid`，免手动复制粘贴。
-  - **模式 B · GitHub Actions 云端调度** — 配置 Secret 后每 6 小时自动巡检续期，零成本、零维护。
+  - **模式 B · GitHub Actions 云端调度** — 配置 Secret 后每 6 小时自动巡检续期；验证码可能拒绝自动浏览器，需留意失败告警。
 - **冷却期智能跳过** — 内置倒计时推算，冷却期内直接跳过续期请求，减少无效调用与被平台频控的风险。
 - **全协议代理支持** — 内置 `proxy_handler.py`，支持 VLESS、VMess、Hysteria2、TUIC、Trojan、AnyTLS、SOCKS5、HTTP(S)，以及双跳链式代理；Actions 中自动拉起 sing-box 并做健康探测。
 - **自动过 Bestcap CAPTCHA** — Vyce 续期接口要求提交 CAPTCHA 令牌。脚本用无头 Chrome + CDP 驱动官方验证组件完成校验，再把令牌随续期请求提交；令牌失效时自动重新求解并重试一次。
@@ -62,7 +62,7 @@ Vyce.cloud 为免费 VPS（如 `Vps-Mini`，1 vCore / 2 GB RAM / 6 GB NVMe / 纯
 
 ### 方式一：GitHub Actions 云端自动调度（推荐）
 
-配置一次，永久生效，不需要任何常开设备。
+配置后不需要常开设备，但应关注 Actions 运行结果；验证码失败时仍需到官网手动续期。
 
 1. **Fork 本仓库**到你的 GitHub 账号。
    > ⚠️ **安全提示**：Fork 后**无需、也严禁**在源码里硬编码任何凭据或节点链接。所有敏感信息一律通过 Actions Secrets 注入。本项目**不读取任何明文凭据文件**，请勿把凭据以文件形式提交到公开仓库。
@@ -165,6 +165,8 @@ python3 app.py
 
 > 冷却期内的 `429 renewal_cooldown` 属于**预期状态**：脚本记录下次可续期窗口、正常退出（状态码 0），不会告警。
 
+> CAPTCHA 续期失败会以非零状态码退出，使 Actions 显示失败。绿色运行仅表示本轮巡检没有错误；如果仍处于冷却期，本轮并未发起续期。是否已续期请以日志中的“机器存活已重置为”或官网剩余时间接近 48 小时为准。
+
 **邮箱通知快速配置（以 QQ 邮箱为例）**：邮箱设置 → 账户 → 开启 SMTP 服务并生成授权码，然后配置 Secrets：`SMTP_HOST=smtp.qq.com`、`SMTP_PORT=465`、`SMTP_USERNAME=你的QQ邮箱`、`SMTP_PASSWORD=授权码`、`EMAIL_TO=接收邮箱`。Gmail（`smtp.gmail.com` + 应用专用密码）、Outlook、企业自建 SMTP 同理，只需换主机与端口。
 
 **或者：接自建 One-Mail 实例直接 HTTP API 发信（无需 SMTP 授权码）**：配置 `ONEMAIL_BASE_URL=https://你的实例`、`ONEMAIL_CREDENTIAL=<凭据>`、`EMAIL_TO=接收邮箱` 即可。`user` 模式填邮箱地址 JWT（发件人即该地址，要求 `send_balance > 0`）；`admin` 模式填管理密码并加配 `EMAIL_FROM` 指定发件地址。One-Mail 侧需已配置发信通道（Resend / SMTP / SEND_MAIL binding）。SMTP 与 One-Mail 两个邮箱渠道各自独立，配了哪个走哪个，都不冲突。
@@ -184,8 +186,8 @@ Content-Type: application/json
 
 1. 启动一个**独立、临时、无头**的 Chrome（随机调试端口 + 临时 profile，用完即删）；
 2. 用 Node 通过 CDP 加载官方验证组件，等待挑战就绪后触发校验；
-3. 从响应中取出 `status=ok` 的 `token`；
-4. **续期请求也在同一个浏览器会话内发起**：注入会话 Cookie、打开 `vyce.cloud`，再用 `fetch` 提交 `{"captchaResponse": token}`。这样请求的来源、UA、出口 IP 与官方前端完全一致——Bestcap 令牌会校验这些请求侧特征，Python 直连提交会被服务端拒绝。
+3. 等待官方组件的回调提供令牌；
+4. **回调触发时立即在同一个浏览器会话内提交续期**：注入会话 Cookie、打开 `vyce.cloud`，再用 `fetch` 提交 `{"captchaResponse": token}`。这与官网前端的提交时机和请求体一致。服务端仍可能拒绝自动浏览器生成的令牌，因此每次都要核对续期结果。
 
 令牌有效期为数十秒，若服务端仍返回 400，脚本会重新求解并重试一次；两次都失败才发送告警。缺少 Chrome/Node 时自动回退到脚本直连（成功率较低，通知中会标注原因）。
 
@@ -215,7 +217,7 @@ Content-Type: application/json
 A：脚本只在冷却结束、进入可续期窗口后调用一次官方续期接口，其余时间仅做少量状态查询，请求频率远低于人工点面板。CAPTCHA 由脚本启动的临时无头浏览器加载官方组件完成，不做逆向绕过、不伪造验证结果，每次续期只求解一次。
 
 **Q：CAPTCHA 求解失败了怎么办？**
-A：先看通知里的 `CAPTCHA:` 后缀。常见原因是缺少 Chrome 或 Node、`CHROME_BIN` 路径不对、代理阻断了 `captcha.vyceai.com`。可以在本地执行 `node captcha_solver.mjs http://127.0.0.1:9222`（配合已开启调试端口的 Chrome）单独验证求解器是否可用。要临时关闭求解可设 `CAPTCHA_SOLVER=off`，但此时续期会失败。
+A：先看通知里的 `CAPTCHA:` 后缀。缺少 Chrome 或 Node、`CHROME_BIN` 路径不对、代理阻断 `captcha.vyceai.com`，以及自动浏览器的验证码令牌被拒，都可能导致失败。后者不能证明官网手动续期也失败；请登录官网手动点击 Renew 并完成验证码，确认剩余时间回到接近 48 小时。可以在本地执行 `node captcha_solver.mjs http://127.0.0.1:9222`（配合已开启调试端口的 Chrome）单独验证求解器是否能获取令牌，但获取令牌不等于服务端接受续期。要临时关闭求解可设 `CAPTCHA_SOLVER=off`，但此时续期会失败。
 
 **Q：Cookie 会过期吗？**
 A：会。Vyce 的会话 Cookie 有有效期，失效后续期会返回鉴权错误并触发 Telegram 告警，此时重新获取 `__Host-vyce_sid` 更新 Secret 即可。本地 CDP 模式无需手动维护 Cookie，只要 Chrome 保持登录状态，每次运行都会自动抓取最新会话。

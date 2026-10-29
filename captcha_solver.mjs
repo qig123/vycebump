@@ -4,14 +4,15 @@
  *
  * Connects to a Chrome DevTools Protocol endpoint, opens vyce.cloud, renders the
  * Bestcap widget through the site's own library, triggers the "I'm not a robot"
- * check and reports the token minted by the captcha service.
+ * check and reports the token passed to the widget callback.
  *
  * The captcha frame refuses to run as a top-level document, so it must be
  * embedded by the page exactly like the official frontend does.
  *
  * With a 4th argument (server id) the script additionally submits the renewal
- * from inside the browser: it POSTs /api/servers/<id>/renew with
- * {"captchaResponse": token} from the already-authenticated page.
+ * from inside the browser as soon as the widget callback fires: it POSTs
+ * /api/servers/<id>/renew with {"captchaResponse": token} from the
+ * already-authenticated page.
  * Renewing from the page itself keeps the request origin, user agent, TLS
  * fingerprint and egress IP identical to the official frontend, which is what
  * the platform's CAPTCHA validation expects.
@@ -106,7 +107,9 @@ async function main() {
     if (r.id && pending.has(r.id)) { pending.get(r.id)(r); pending.delete(r.id); return; }
     if (token) return;
 
-    if (r.method === 'Network.loadingFinished') {
+    // Renewal must use the widget callback, as the official frontend does.
+    // A token seen in a network response can precede the callback.
+    if (!RENEW_SERVER_ID && r.method === 'Network.loadingFinished') {
       const body = await send('Network.getResponseBody', { requestId: r.params.requestId }, r.sessionId);
       const text = body && body.result && body.result.body;
       if (!text) return;
@@ -163,10 +166,22 @@ async function main() {
     await sleep(1500);
   }
 
+  if (RENEW_SERVER_ID) {
+    // Verify the session before asking for a token, so the callback can submit
+    // the renewal immediately without another round trip first.
+    const authStatus = valueOf(await send('Runtime.evaluate', {
+      expression: `fetch('/api/me',{credentials:'same-origin'}).then(r=>r.status).catch(()=>0)`,
+      awaitPromise: true,
+      returnByValue: true,
+    }));
+    if (authStatus !== 200) throw new Error(`browser session rejected the cookie (HTTP ${authStatus})`);
+  }
+
   // 和前端一样把控件渲染到页面里，由库自己创建 iframe。
+  const renewPath = `/api/servers/${encodeURIComponent(RENEW_SERVER_ID)}/renew`;
   const rendered = valueOf(await send('Runtime.evaluate', {
     expression: `(()=>{try{
-      window.__bcToken=null;window.__bcError=null;window.__bcMsgs=[];
+      window.__bcToken=null;window.__bcError=null;window.__bcMsgs=[];window.__bcRenewPromise=null;
       window.addEventListener('message',(ev)=>{
         const d=ev.data;
         if(d&&typeof d==='object'&&d.bc===1) window.__bcMsgs.push(String(d.type||''));
@@ -177,7 +192,20 @@ async function main() {
       document.body.appendChild(host);
       window.bestcap.render(host,{
         sitekey:${JSON.stringify(SITEKEY)},
-        callback:(v)=>{window.__bcToken=v;},
+        callback:(v)=>{
+          if(window.__bcRenewPromise)return;
+          window.__bcToken=v;
+          ${RENEW_SERVER_ID ? `window.__bcRenewPromise=(async()=>{try{
+            const r=await fetch(${JSON.stringify(renewPath)},{
+              method:'POST',credentials:'same-origin',
+              headers:{'Content-Type':'application/json'},
+              body:JSON.stringify({captchaResponse:v}),
+              signal:AbortSignal.timeout(${RENEW_TIMEOUT_MS})
+            });
+            const body=await r.text();
+            return JSON.stringify({status:r.status,body:body.slice(0,800)});
+          }catch(e){return JSON.stringify({status:0,body:String((e&&e.message)||e)});}})();` : ''}
+        },
         'expired-callback':()=>{window.__bcExpired=true;},
         'error-callback':(e)=>{window.__bcError=String((e&&e.message)||e);}
       });
@@ -249,9 +277,13 @@ async function main() {
   process.stdout.write(`TOKEN:${token}\n`);
 
   if (RENEW_SERVER_ID) {
-    // Bestcap 令牌生成后，给验证码后端与页面 1.5 秒同步就绪时间，避免立即 siteverify 遇到副本同步延迟
-    await sleep(1500);
-    const renew = await renewInBrowser(send, token, sessionId);
+    // The callback has already submitted the request; only collect its result.
+    const renew = valueOf(await send('Runtime.evaluate', {
+      expression: 'window.__bcRenewPromise',
+      awaitPromise: true,
+      returnByValue: true,
+    }, sessionId));
+    if (!renew) throw new Error('captcha callback did not submit renewal');
     process.stdout.write(`RENEW:${renew}\n`);
   }
 
@@ -284,35 +316,6 @@ async function attachFrameTarget(send) {
     if (sid) return sid;
   }
   return null;
-}
-
-async function renewInBrowser(send, token, sid) {
-
-  // Confirm the session works before spending the token.
-  const authStatus = valueOf(await send('Runtime.evaluate', {
-    expression: `fetch('/api/me',{credentials:'include'}).then(r=>r.status).catch(()=>0)`,
-    awaitPromise: true,
-    returnByValue: true,
-  }, sid));
-  if (authStatus !== 200) {
-    return JSON.stringify({ status: 0, body: `browser session rejected the cookie (HTTP ${authStatus})` });
-  }
-
-  const expression =
-    `(async()=>{try{` +
-    `const r=await fetch('/api/servers/${encodeURIComponent(RENEW_SERVER_ID)}/renew',{` +
-    `method:'POST',credentials:'include',` +
-    `headers:{'Content-Type':'application/json','Accept':'application/json'},` +
-    `body:JSON.stringify({captchaResponse:${JSON.stringify(token)}})});` +
-    `const t=await r.text();` +
-    `return JSON.stringify({status:r.status,body:t.slice(0,800)});` +
-    `}catch(e){return JSON.stringify({status:0,body:String((e&&e.message)||e)});}})()`;
-
-  const value = valueOf(await send('Runtime.evaluate', {
-    expression, awaitPromise: true, returnByValue: true,
-  }, sid));
-
-  return value || JSON.stringify({ status: 0, body: 'renewal evaluation returned nothing' });
 }
 
 main().catch((err) => fail(err.message || String(err)));

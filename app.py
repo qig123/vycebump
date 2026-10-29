@@ -172,9 +172,8 @@ def is_captcha_error(code: int, msg: str) -> bool:
 def is_captcha_token_rejected(code: int, msg: str) -> bool:
     """区分「令牌被拒」与「没交令牌」。
 
-    服务端返回 `invalid_captcha` / `CAPTCHA verification failed` 时，说明
-    请求里带着令牌但校验没过——这一分支与本机求解无关：官网手动续期在同样
-    情况下也会收到完全相同的响应。
+    该响应只说明本次请求未通过服务端校验，不能据此判断官网手动续期也会失败，
+    或者断定故障发生在服务端。
     """
     if code != 400 or not msg:
         return False
@@ -1289,8 +1288,6 @@ def process_account(account: Dict, state: Dict, proxy: Optional[str] = None) -> 
 
                 is_critical = time_left_sec <= 2 * 3600
                 is_captcha_fail = is_captcha_error(code, msg)
-                upstream_captcha_grace = is_captcha_fail and not is_critical
-
                 state[srv_id] = {
                     "name": srv_name,
                     "user": real_username,
@@ -1298,7 +1295,6 @@ def process_account(account: Dict, state: Dict, proxy: Optional[str] = None) -> 
                     "error": safe_error_text(msg),
                     "last_check_ts": now_ms,
                     "last_fail_notified_ts": last_fail_notified_ts,
-                    "upstream_captcha_grace": upstream_captcha_grace,
                 }
                 error_msg = f"HTTP {code}: {safe_error_text(msg)}"
                 if is_captcha_fail:
@@ -1306,22 +1302,21 @@ def process_account(account: Dict, state: Dict, proxy: Optional[str] = None) -> 
                         reason = captcha_error
                     elif is_captcha_token_rejected(code, msg):
                         reason = (
-                            "令牌已生成并被服务端拒绝（invalid_captcha）；"
-                            "官网手动续期同样报此错，属 vyce.cloud/Bestcap 侧校验故障，"
-                            "下次调度会自动重试；已就绪 start 兜底保护"
+                            "本次自动续期的 CAPTCHA 令牌未通过服务端校验；"
+                            "请在官网手动续期并核对剩余时间，下次调度会自动重试"
                         )
                         if is_critical:
                             reason += "；⚠️ 机器剩余存活已不足 2 小时，临近到期！"
-                        print("   ℹ️ 官网手动续期在同一环境下同样失败，本机无需调整。")
+                        print("   ℹ️ 自动续期的验证码未通过校验；此结果不能说明官网手动续期也会失败。")
                     else:
                         reason = "服务端未收到有效 CAPTCHA 令牌"
                     error_msg += f"（CAPTCHA: {reason}）"
 
-                # 告警抑制机制：非紧急状态下的上游验证码故障在 8 小时内仅通知一次，避免每 2 小时定时调度轰炸
+                # 告警抑制机制：非紧急状态下的验证码失败在 8 小时内仅通知一次。
                 should_notify = True
-                if upstream_captcha_grace and (now_ms - last_fail_notified_ts < 8 * ONE_HOUR_MS):
+                if is_captcha_fail and not is_critical and (now_ms - last_fail_notified_ts < 8 * ONE_HOUR_MS):
                     should_notify = False
-                    print(f"   ℹ️ 8小时内已发送过上游验证码故障告警，当前存活充足 ({time_left_str})，本轮抑制重复通知。")
+                    print(f"   ℹ️ 8小时内已发送过验证码失败告警，当前存活充足 ({time_left_str})，本轮抑制重复通知。")
 
                 if should_notify:
                     state[srv_id]["last_fail_notified_ts"] = now_ms
@@ -1366,7 +1361,6 @@ def main():
 
     state = load_state()
     all_success = True
-    has_critical_failure = False
 
     for acc in accounts:
         try:
@@ -1376,33 +1370,14 @@ def main():
         except Exception as e:
             print(f"❌ 处理账户 {mask_username(acc.get('name', ''))} 时出现未捕获异常: {safe_error_text(e)}")
             all_success = False
-            has_critical_failure = True
 
     if not save_state(state):
         all_success = False
-        has_critical_failure = True
 
     print(f"\n✅ 任务处理完毕，状态已保存至 {STATE_FILE}。")
     if not all_success:
-        # 检查是否所有失败均属于非紧急期的上游验证码故障 (存活 > 2小时)
-        only_upstream_captcha_in_grace_period = True
-        failed_servers = [
-            s for s in state.values() if isinstance(s, dict) and s.get("status") == "failed"
-        ]
-        if not failed_servers or has_critical_failure:
-            only_upstream_captcha_in_grace_period = False
-        else:
-            for s in failed_servers:
-                if not s.get("upstream_captcha_grace", False):
-                    only_upstream_captcha_in_grace_period = False
-                    break
-
-        if only_upstream_captcha_in_grace_period:
-            print("ℹ️ 当前续期异常均属 Vyce 官方服务端 Bestcap 校验故障，且机器剩余存活时间充足（> 2小时）。")
-            print("ℹ️ 本轮处于宽限自动重试期，暂不作为致命异常退出 (exit 0)，避免触发无谓 CI 红线与报警邮件。")
-        else:
-            print("❌ 检测到有账户处理失败或续期紧急异常，以非零状态码退出 (exit 1)。")
-            sys.exit(1)
+        print("❌ 检测到账户处理或续期失败，以非零状态码退出 (exit 1)。")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

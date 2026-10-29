@@ -337,8 +337,8 @@ class TestRenewalCaptchaIntegration(unittest.TestCase):
     ))
     @patch("app.obtain_captcha_token")
     @patch("app.VyceClient")
-    def test_rejected_token_notification_points_at_server_side(self, client_cls, obtain, browser, notify):
-        """令牌已生成却被拒：告警必须指向服务端校验故障，而不是本机环境。"""
+    def test_rejected_token_notification_does_not_guess_manual_result(self, client_cls, obtain, browser, notify):
+        """自动令牌被拒时，不推断官网手动续期也会失败。"""
         client = self._stub_client(client_cls, [
             (False, 400, "CAPTCHA verification failed."),
             (False, 400, "CAPTCHA verification failed."),
@@ -346,8 +346,8 @@ class TestRenewalCaptchaIntegration(unittest.TestCase):
         self.assertFalse(app.process_account(self.account, {}))
         self.assertEqual(browser.call_count, 2)
         error_msg = notify.call_args.kwargs["error_msg"]
-        self.assertIn("invalid_captcha", error_msg)
-        self.assertIn("官网手动续期同样报此错", error_msg)
+        self.assertIn("未通过服务端校验", error_msg)
+        self.assertNotIn("官网手动续期同样报此错", error_msg)
         self.assertNotIn("CHROME_BIN", error_msg)
 
     @patch("app.send_notification")
@@ -632,8 +632,8 @@ class TestStartServerFallback(unittest.TestCase):
     ))
     @patch("app.obtain_captcha_token")
     @patch("app.VyceClient")
-    def test_upstream_captcha_failure_notification_suppression_within_8_hours(self, client_cls, obtain, browser, notify):
-        """上游验证码故障在存活充足时，8 小时内抑制重复告警通知。"""
+    def test_captcha_failure_notification_suppression_within_8_hours(self, client_cls, obtain, browser, notify):
+        """验证码失败在存活充足时，8 小时内抑制重复告警通知。"""
         now = int(time.time() * 1000)
         srv = {
             "id": "srv-grace",
@@ -652,7 +652,7 @@ class TestStartServerFallback(unittest.TestCase):
         ok1 = app.process_account({"cookie": "secret", "name": "test"}, state)
         self.assertFalse(ok1)
         self.assertEqual(notify.call_count, 1)
-        self.assertTrue(state["srv-grace"]["upstream_captcha_grace"])
+        self.assertEqual(state["srv-grace"]["status"], "failed")
         self.assertAlmostEqual(state["srv-grace"]["last_fail_notified_ts"], now, delta=5000)
 
         # 第 2 次调度（2小时后）：8小时内，抑制告警
@@ -677,7 +677,7 @@ class TestStartServerFallback(unittest.TestCase):
     ))
     @patch("app.obtain_captcha_token")
     @patch("app.VyceClient")
-    def test_upstream_captcha_failure_never_suppressed_when_critical(self, client_cls, obtain, browser, notify):
+    def test_captcha_failure_never_suppressed_when_critical(self, client_cls, obtain, browser, notify):
         """临近到期 (<=2小时) 时绝不抑制告警，即使刚发送过。"""
         now = int(time.time() * 1000)
         srv_critical = {
@@ -707,20 +707,17 @@ class TestStartServerFallback(unittest.TestCase):
     @patch("app.load_state")
     @patch("app.load_accounts")
     @patch("app.process_account", return_value=False)
-    def test_main_exits_zero_during_upstream_captcha_grace_period(self, process_mock, load_acc, load_st, save_st):
-        """当所有失败均为上游验证码宽限期 (存活>2h) 时，main() 不抛出 SystemExit(1)。"""
+    def test_main_exits_one_on_noncritical_captcha_failure(self, process_mock, load_acc, load_st, save_st):
+        """验证码失败即使剩余存活时间充足，也不能把工作流标为成功。"""
         load_acc.return_value = [{"cookie": "c", "name": "acc"}]
         load_st.return_value = {
             "srv-1": {
                 "status": "failed",
-                "upstream_captcha_grace": True,
             }
         }
-        # 不应触发 SystemExit
-        try:
+        with self.assertRaises(SystemExit) as cm:
             app.main()
-        except SystemExit as e:
-            self.fail(f"main() unexpectedly raised SystemExit({e.code}) during upstream captcha grace period")
+        self.assertEqual(cm.exception.code, 1)
 
     @patch("app.save_state", return_value=True)
     @patch("app.load_state")
@@ -732,7 +729,6 @@ class TestStartServerFallback(unittest.TestCase):
         load_st.return_value = {
             "srv-1": {
                 "status": "failed",
-                "upstream_captcha_grace": False,  # 紧急或非验证码错误
             }
         }
         with self.assertRaises(SystemExit) as cm:
